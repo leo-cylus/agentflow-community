@@ -1,0 +1,103 @@
+name: Sync Collections to Production
+
+on:
+  push:
+    branches: [main]
+    paths: 
+      - 'collections/**'
+      - 'public_collections.yaml'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run in dry-run mode'
+        type: boolean
+        default: false
+      force_full_sync:
+        description: 'Force full sync (ignore LAST_SYNC_COMMIT)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/agentflow-sync:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for git diff
+
+      - name: Fix git safe directory
+        run: git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Validate collections
+        run: node /app/scripts/validate-collections.js
+        env:
+          API_BASE_URL: ${{ secrets.PROD_API_BASE_URL }}
+          COLLECTIONS_DIR: ${{ github.workspace }}/collections
+          LAST_SYNC_COMMIT: ${{ vars.PROD_LAST_SYNC_COMMIT }}
+
+  sync:
+    runs-on: ubuntu-latest
+    needs: validate  # Only run sync after validation succeeds
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/agentflow-sync:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout collections repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for git diff
+
+      - name: Fix git safe directory
+        run: git config --global --add safe.directory $GITHUB_WORKSPACE
+
+      - name: Set production sync commit variable
+        run: |
+          if [ "${{ github.event.inputs.force_full_sync }}" = "true" ]; then
+            echo "LAST_SYNC_COMMIT=" >> $GITHUB_ENV
+            echo "Force full sync enabled - LAST_SYNC_COMMIT set to empty"
+          else
+            echo "LAST_SYNC_COMMIT=${{ vars.PROD_LAST_SYNC_COMMIT }}" >> $GITHUB_ENV
+            echo "Incremental sync - LAST_SYNC_COMMIT set to: ${{ vars.PROD_LAST_SYNC_COMMIT }}"
+          fi
+
+      - name: Sync collections to Production API
+        run: | 
+          echo "current LAST_SYNC_COMMIT is: $LAST_SYNC_COMMIT"
+          echo "starting the sync-collections script for PRODUCTION"
+          node /app/scripts/sync-collections.js
+        env:
+          ADMIN_API_TOKEN: ${{ secrets.PROD_ADMIN_API_TOKEN }}
+          API_BASE_URL: ${{ secrets.PROD_API_BASE_URL }}
+          LAST_SYNC_COMMIT: ${{ env.LAST_SYNC_COMMIT }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          COLLECTIONS_DIR: ${{ github.workspace }}/collections
+
+      - name: Update production sync state
+        if: success() && github.event.inputs.dry_run != 'true'
+        run: |
+          git config --global --add safe.directory $GITHUB_WORKSPACE
+          CURRENT_COMMIT=$(git rev-parse HEAD)
+          echo "Updating PROD_LAST_SYNC_COMMIT to: $CURRENT_COMMIT"
+          gh variable set PROD_LAST_SYNC_COMMIT --body "$CURRENT_COMMIT"
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+      - name: Report sync failure
+        if: failure()
+        run: |
+          echo "::error::Collection sync failed. LAST_SYNC_COMMIT was not updated."
+          echo "Next run will retry from the same commit: ${{ vars.LAST_SYNC_COMMIT }}"
